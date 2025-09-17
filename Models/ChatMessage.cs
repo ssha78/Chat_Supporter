@@ -3,6 +3,33 @@ using Newtonsoft.Json;
 
 namespace ChatSupporter.Models;
 
+// MessageType 문자열 변환기
+public class MessageTypeConverter : JsonConverter<MessageType>
+{
+    public override void WriteJson(JsonWriter writer, MessageType value, JsonSerializer serializer)
+    {
+        writer.WriteValue(value.ToString());
+    }
+
+    public override MessageType ReadJson(JsonReader reader, Type objectType, MessageType existingValue, bool hasExistingValue, JsonSerializer serializer)
+    {
+        if (reader.Value is string stringValue)
+        {
+            return stringValue.ToLowerInvariant() switch
+            {
+                "customer" => MessageType.User,
+                "user" => MessageType.User,
+                "staff" => MessageType.Staff,
+                "system" => MessageType.System,
+                "ai" => MessageType.AI,
+                "notification" => MessageType.Notification,
+                _ => MessageType.User
+            };
+        }
+        return MessageType.User;
+    }
+}
+
 public class ChatMessage
 {
     [JsonProperty("id")]
@@ -21,6 +48,7 @@ public class ChatMessage
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
     
     [JsonProperty("type")]
+    [JsonConverter(typeof(MessageTypeConverter))]
     public MessageType Type { get; set; } = MessageType.User;
     
     [JsonProperty("isFromStaff")]

@@ -6,7 +6,8 @@ public class SessionService
 {
     private readonly GoogleAppsScriptService _apiService;
     private readonly ConfigurationService _configService;
-    
+    private readonly DebugLogService _debugLog;
+
     private ChatSession? _currentSession;
     private readonly List<ChatMessage> _messageHistory = new();
     private readonly System.Threading.Timer _syncTimer;
@@ -18,13 +19,18 @@ public class SessionService
     public ChatSession? CurrentSession => _currentSession;
     public IReadOnlyList<ChatMessage> MessageHistory => _messageHistory.AsReadOnly();
 
-    public SessionService(GoogleAppsScriptService apiService, ConfigurationService configService)
+    public SessionService(GoogleAppsScriptService apiService, ConfigurationService configService, DebugLogService debugLog)
     {
         _apiService = apiService;
         _configService = configService;
-        
+        _debugLog = debugLog;
+
+        _debugLog.LogSession("SessionService 초기화", "시작");
+
         var refreshInterval = TimeSpan.FromSeconds(Math.Max(2, _configService.Settings.Chat.RefreshIntervalSeconds)); // 최소 2초
         _syncTimer = new System.Threading.Timer(SyncMessages, null, refreshInterval, refreshInterval);
+
+        _debugLog.LogSession("SessionService 초기화", $"완료 - 동기화 간격: {refreshInterval.TotalSeconds}초");
     }
 
     public async Task<bool> StartSessionAsync(string serialNumber, Customer? customer = null)
@@ -83,11 +89,15 @@ public class SessionService
     {
         try
         {
+            _debugLog.LogSession("세션 참여 시작", existingSession.Id, $"고객: {existingSession.Customer?.SerialNumber}");
+
             // 기존 세션을 현재 세션으로 설정
             _currentSession = existingSession;
 
             // 기존 메시지 히스토리 로드
             await LoadMessageHistoryAsync(_currentSession.Id);
+
+            _debugLog.LogSession("세션 참여 완료", _currentSession.Id, $"메시지 수: {_messageHistory.Count}");
 
             StatusUpdate?.Invoke(this, $"기존 세션 참여: {_currentSession.Id}");
             SessionStatusChanged?.Invoke(this, _currentSession);
@@ -96,6 +106,7 @@ public class SessionService
         }
         catch (Exception ex)
         {
+            _debugLog.LogError("세션 참여 실패", ex.Message);
             StatusUpdate?.Invoke(this, $"세션 참여 실패: {ex.Message}");
             return false;
         }
@@ -105,41 +116,52 @@ public class SessionService
     {
         if (_currentSession == null)
         {
+            _debugLog.LogError("메시지 전송", "활성 세션이 없습니다");
             StatusUpdate?.Invoke(this, "활성 세션이 없습니다");
             return false;
         }
 
         try
         {
+            _debugLog.LogMessage("메시지 전송 시작", sender ?? "Unknown", content, $"타입: {type}");
+
             // 한국 시간으로 메시지 타임스탬프 설정
             var koreaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Korea Standard Time");
             var koreaTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, koreaTimeZone);
+
+            var senderName = sender ?? (type == MessageType.Staff ? "직원" : (_currentSession.Customer?.SerialNumber ?? "Unknown"));
 
             var message = new ChatMessage
             {
                 Id = Guid.NewGuid().ToString(),
                 SessionId = _currentSession.Id,
                 Content = content,
-                Sender = sender ?? (_currentSession.Customer?.SerialNumber ?? "Unknown"),
+                Sender = senderName,
                 Type = type,
                 Timestamp = koreaTime, // 한국 시간으로 설정
                 IsFromStaff = type == MessageType.Staff
             };
+
+            _debugLog.LogMessage("메시지 생성", senderName, content, $"타입: {type}, ID: {message.Id}");
 
             // 먼저 로컬에 메시지 추가 (사용자 경험 개선)
             _messageHistory.Add(message);
             MessageReceived?.Invoke(this, message);
             _currentSession.LastActivity = DateTime.UtcNow;
 
+            _debugLog.LogMessage("로컬 메시지 추가", message.Sender, message.Content, $"ID: {message.Id}");
+
             var response = await _apiService.SendMessageAsync(message);
 
             if (response.Success)
             {
+                _debugLog.LogAPI("메시지 전송", "성공", message.Id);
                 StatusUpdate?.Invoke(this, "메시지 서버 전송 완료");
                 return true;
             }
             else
             {
+                _debugLog.LogAPI("메시지 전송", "실패", response.Message);
                 StatusUpdate?.Invoke(this, $"서버 전송 실패: {response.Message}");
                 // 서버 전송은 실패했지만 로컬 표시는 성공
                 return false;
@@ -147,6 +169,7 @@ public class SessionService
         }
         catch (Exception ex)
         {
+            _debugLog.LogError("메시지 전송 오류", ex.Message);
             StatusUpdate?.Invoke(this, $"메시지 전송 오류: {ex.Message}");
             return false;
         }
@@ -327,10 +350,21 @@ public class SessionService
     {
         try
         {
-            var response = await _apiService.GetChatHistoryAsync(sessionId);
+            _debugLog.LogSession("메시지 히스토리 로딩 시작", sessionId);
+            StatusUpdate?.Invoke(this, $"메시지 히스토리 로딩 시작: {sessionId}");
+
+            var progress = new Progress<string>(message =>
+            {
+                _debugLog.LogAPI("히스토리 API", "진행", message);
+                StatusUpdate?.Invoke(this, message);
+            });
+
+            var response = await _apiService.GetChatHistoryAsync(sessionId, progress);
 
             if (response.Success && response.Data != null)
             {
+                _debugLog.LogAPI("히스토리 로딩", "성공", $"{response.Data.Count}개 메시지");
+                StatusUpdate?.Invoke(this, $"서버에서 {response.Data.Count}개 메시지 수신됨");
                 _messageHistory.Clear();
 
                 foreach (var message in response.Data.OrderBy(m => m.Timestamp))
@@ -346,13 +380,22 @@ public class SessionService
 
                     _messageHistory.Add(message);
                     MessageReceived?.Invoke(this, message);
+                    _debugLog.LogMessage("히스토리 메시지 로드", message.Sender, message.Content, $"ID: {message.Id}");
+                    StatusUpdate?.Invoke(this, $"메시지 로드: {message.Sender} - {message.Content.Substring(0, Math.Min(30, message.Content.Length))}...");
                 }
 
-                StatusUpdate?.Invoke(this, $"메시지 히스토리 로드됨: {_messageHistory.Count}개");
+                _debugLog.LogSession("메시지 히스토리 로딩 완료", sessionId, $"{_messageHistory.Count}개 메시지");
+                StatusUpdate?.Invoke(this, $"메시지 히스토리 로드 완료: {_messageHistory.Count}개");
+            }
+            else
+            {
+                _debugLog.LogAPI("히스토리 로딩", "실패", response.Message);
+                StatusUpdate?.Invoke(this, $"메시지 히스토리 로드 실패: {response.Message}");
             }
         }
         catch (Exception ex)
         {
+            _debugLog.LogError("히스토리 로드 오류", ex.Message);
             StatusUpdate?.Invoke(this, $"히스토리 로드 오류: {ex.Message}");
         }
     }

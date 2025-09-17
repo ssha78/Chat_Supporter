@@ -9,7 +9,8 @@ public partial class MainForm : Form
     private readonly GoogleAppsScriptService _apiService;
     private readonly SessionService _sessionService;
     private readonly DeviceDetectionService _deviceService;
-    
+    private readonly DebugLogService _debugLog;
+
     private SessionManagerForm? _sessionManager;
     private bool _isStaffMode = false;
     private string _currentSerialNumber = string.Empty;
@@ -17,19 +18,25 @@ public partial class MainForm : Form
     public MainForm()
     {
         InitializeComponent();
-        
+
+        // 디버깅 로그 초기화 (Customer 모드로 시작)
+        _debugLog = new DebugLogService("Customer");
+        _debugLog.LogUI("앱 시작", "MainForm 초기화 시작");
+
         _configService = new ConfigurationService();
         _apiService = new GoogleAppsScriptService(
             _configService.Settings.GoogleAppsScript.ChatApiUrl,
             _configService.Settings.GoogleAppsScript.MaxRetries,
             _configService.Settings.GoogleAppsScript.TimeoutSeconds
         );
-        _sessionService = new SessionService(_apiService, _configService);
+        _sessionService = new SessionService(_apiService, _configService, _debugLog);
         _deviceService = new DeviceDetectionService();
-        
+
         SetupForm();
         SetupEvents();
         DetectDevicesAndStartSession();
+
+        _debugLog.LogUI("앱 시작", "MainForm 초기화 완료");
     }
 
     private void SetupForm()
@@ -243,14 +250,20 @@ public partial class MainForm : Form
 
         if (_isStaffMode)
         {
+            _debugLog.LogUI("모드 전환", "직원 모드로 전환");
             StaffModeButton.Text = "고객 모드";
             StaffModeButton.BackColor = Color.Orange;
             ConnectToStaffButton.Visible = false;
+
+            // 로그 모드를 Staff로 변경
+            var staffDebugLog = new DebugLogService("Staff");
+            // SessionService에 새 로그 서비스 설정 (실제로는 SessionService 재생성이 필요하지만 임시로 현재 로그 사용)
 
             ShowSessionManager();
         }
         else
         {
+            _debugLog.LogUI("모드 전환", "고객 모드로 전환");
             StaffModeButton.Text = "직원 모드";
             StaffModeButton.BackColor = SystemColors.Control;
             ConnectToStaffButton.Visible = true;
@@ -366,8 +379,16 @@ public partial class MainForm : Form
     {
         if (_sessionService.CurrentSession?.Id != session.Id)
         {
+            _debugLog.LogUI("직원 세션 선택", $"세션 ID: {session.Id}, 고객: {session.Customer?.SerialNumber}");
+
             // 기존 세션 종료
             _sessionService.EndSession();
+
+            // 채팅창 클리어 (새 세션 메시지 로딩 전에)
+            ChatListBox.Items.Clear();
+            _debugLog.LogUI("채팅창 클리어", "새 세션 로딩 준비");
+            StatusLabel.Text = "세션 연결 중...";
+            StatusLabel.ForeColor = Color.Orange;
 
             // 선택된 세션으로 직접 전환 (새로 생성하지 않고)
             _currentSerialNumber = session.Customer?.SerialNumber ?? session.Id;
@@ -375,7 +396,7 @@ public partial class MainForm : Form
 
             if (success)
             {
-                ChatListBox.Items.Clear();
+                _debugLog.LogUI("세션 연결 성공", $"세션 ID: {session.Id}");
                 this.Text = $"Chat Supporter - {session.Customer?.SerialNumber ?? "Unknown"} (직원모드)";
 
                 // 세션 상태 UI 업데이트
@@ -384,14 +405,19 @@ public partial class MainForm : Form
                     CompleteClaimButton.Enabled = _sessionService.CurrentSession.Status != SessionStatus.Completed;
                 }
 
-                StatusLabel.Text = $"세션 전환됨: {session.Id}";
+                StatusLabel.Text = $"세션 연결 완료: {session.Id}";
                 StatusLabel.ForeColor = Color.Green;
             }
             else
             {
+                _debugLog.LogError("세션 연결 실패", $"세션 ID: {session.Id}");
                 StatusLabel.Text = "세션 전환 실패";
                 StatusLabel.ForeColor = Color.Red;
             }
+        }
+        else
+        {
+            _debugLog.LogUI("동일 세션 선택", $"이미 연결된 세션: {session.Id}");
         }
     }
 
