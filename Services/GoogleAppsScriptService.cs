@@ -13,12 +13,31 @@ public class GoogleAppsScriptService
 
     public GoogleAppsScriptService(string apiUrl, int maxRetries = 3, int timeoutSeconds = 30)
     {
-        _apiUrl = apiUrl;
+        // URI 유효성 검증
+        if (string.IsNullOrWhiteSpace(apiUrl))
+        {
+            throw new ArgumentException("API URL이 비어있습니다.", nameof(apiUrl));
+        }
+
+        _apiUrl = apiUrl.Trim();
         _maxRetries = maxRetries;
         _timeoutSeconds = timeoutSeconds;
-        
-        _httpClient = new HttpClient();
+
+        if (!Uri.TryCreate(_apiUrl, UriKind.Absolute, out var uri))
+        {
+            throw new UriFormatException($"잘못된 API URL 형식: {_apiUrl}");
+        }
+
+        // HttpClientHandler로 리다이렉트 자동 처리 설정
+        var handler = new HttpClientHandler()
+        {
+            AllowAutoRedirect = true,
+            MaxAutomaticRedirections = 5
+        };
+
+        _httpClient = new HttpClient(handler);
         _httpClient.Timeout = TimeSpan.FromSeconds(_timeoutSeconds);
+        _httpClient.DefaultRequestHeaders.Add("User-Agent", "ChatSupporter/1.0");
     }
 
     public async Task<ApiResponse<T>> SendRequestAsync<T>(string action, object data, IProgress<string>? progress = null)
@@ -31,7 +50,7 @@ public class GoogleAppsScriptService
         };
 
         var json = JsonConvert.SerializeObject(request);
-        progress?.Report($"API 요청 전송: {action}");
+        progress?.Report($"API 요청 전송: {action} → {_apiUrl}");
 
         for (int attempt = 1; attempt <= _maxRetries; attempt++)
         {
@@ -43,33 +62,40 @@ public class GoogleAppsScriptService
                 if (response.IsSuccessStatusCode)
                 {
                     var responseJson = await response.Content.ReadAsStringAsync();
+                    progress?.Report($"API 응답 내용: {responseJson.Substring(0, Math.Min(200, responseJson.Length))}...");
+
                     var result = JsonConvert.DeserializeObject<ApiResponse<T>>(responseJson);
-                    
+
                     progress?.Report($"API 응답 성공: {action}");
                     return result ?? new ApiResponse<T> { Success = false, Message = "응답 파싱 실패" };
                 }
                 else
                 {
-                    progress?.Report($"API 오류 (시도 {attempt}/{_maxRetries}): {response.StatusCode}");
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    progress?.Report($"API 오류 (시도 {attempt}/{_maxRetries}): {response.StatusCode} - {response.ReasonPhrase}");
                     if (attempt == _maxRetries)
                     {
                         return new ApiResponse<T>
                         {
                             Success = false,
-                            Message = $"HTTP 오류: {response.StatusCode}"
+                            Message = $"HTTP 오류: {response.StatusCode} {response.ReasonPhrase}\n응답: {errorContent?.Substring(0, Math.Min(200, errorContent?.Length ?? 0))}"
                         };
                     }
                 }
             }
             catch (Exception ex)
             {
-                progress?.Report($"네트워크 오류 (시도 {attempt}/{_maxRetries}): {ex.Message}");
+                progress?.Report($"네트워크 오류 (시도 {attempt}/{_maxRetries}): {ex.GetType().Name} - {ex.Message}");
                 if (attempt == _maxRetries)
                 {
+                    var detailMessage = ex is UriFormatException
+                        ? $"URI 형식 오류: '{_apiUrl}' - {ex.Message}"
+                        : $"네트워크 오류: {ex.Message}";
+
                     return new ApiResponse<T>
                     {
                         Success = false,
-                        Message = $"네트워크 오류: {ex.Message}"
+                        Message = detailMessage
                     };
                 }
             }
@@ -122,10 +148,26 @@ public class GoogleAppsScriptService
         return await SendRequestAsync<string>("getAIResponse", new { question, category }, progress);
     }
     
-    // 활성 세션 목록 조회
+    // 활성 세션 목록 조회 (1시간 이내, 직원 요청 우선)
     public async Task<ApiResponse<List<ChatSession>>> GetActiveSessionsAsync(IProgress<string>? progress = null)
     {
-        return await SendRequestAsync<List<ChatSession>>("getActiveSessions", new { }, progress);
+        // 한국 시간 기준으로 1시간 전 계산
+        var koreaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Korea Standard Time");
+        var koreaTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, koreaTimeZone);
+        var oneHourAgo = koreaTime.AddHours(-1);
+
+        var requestData = new
+        {
+            fromDate = oneHourAgo.ToString("yyyy-MM-ddTHH:mm:ss"), // 한국 시간 기준
+            excludeStatus = "Completed", // 완료된 세션 제외
+            prioritizeStaffRequest = true, // 직원 요청 세션 상위 표시
+            timeZone = "KST" // 한국 표준시 명시
+        };
+
+        progress?.Report($"1시간 필터 기준: {oneHourAgo:yyyy-MM-dd HH:mm:ss} KST");
+        progress?.Report($"API URL: {_apiUrl}");
+
+        return await SendRequestAsync<List<ChatSession>>("getActiveSessions", requestData, progress);
     }
     
     // 학습 데이터 목록 조회 (ML 모델 학습용)
@@ -176,7 +218,19 @@ public class GoogleAppsScriptService
         return await SendRequestAsync<bool>("getAttachmentRequestStatus", new { sessionId }, progress);
     }
     
-    // 세션 상태 업데이트
+    // 새 세션 생성
+    public async Task<ApiResponse<ChatSession>> CreateSessionAsync(ChatSession session, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<ChatSession>("createSession", session, progress);
+    }
+
+    // 세션 정보 업데이트
+    public async Task<ApiResponse<ChatSession>> UpdateSessionAsync(ChatSession session, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<ChatSession>("updateSession", session, progress);
+    }
+
+    // 세션 상태 업데이트 (기존)
     public async Task<ApiResponse<bool>> UpdateSessionStatusAsync(string sessionId, SessionStatus status, IProgress<string>? progress = null)
     {
         return await SendRequestAsync<bool>("updateSessionStatus", new { sessionId, status = status.ToString() }, progress);

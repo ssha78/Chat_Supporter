@@ -23,33 +23,81 @@ public class SessionService
         _apiService = apiService;
         _configService = configService;
         
-        var refreshInterval = TimeSpan.FromSeconds(_configService.Settings.Chat.RefreshIntervalSeconds);
+        var refreshInterval = TimeSpan.FromSeconds(Math.Max(2, _configService.Settings.Chat.RefreshIntervalSeconds)); // 최소 2초
         _syncTimer = new System.Threading.Timer(SyncMessages, null, refreshInterval, refreshInterval);
     }
 
-    public Task<bool> StartSessionAsync(string serialNumber, Customer? customer = null)
+    public async Task<bool> StartSessionAsync(string serialNumber, Customer? customer = null)
     {
         try
         {
-            var sessionId = GenerateSessionId(serialNumber);
-            
-            _currentSession = new ChatSession
-            {
-                Id = sessionId,
-                Customer = customer ?? new Customer { SerialNumber = serialNumber },
-                Status = SessionStatus.Online,
-                StartedAt = DateTime.UtcNow
-            };
+            // 먼저 해당 시리얼 번호의 활성 세션이 있는지 확인
+            var existingSession = await GetActiveSessionBySerialNumberAsync(serialNumber);
 
-            StatusUpdate?.Invoke(this, "세션 시작됨");
+            if (existingSession != null)
+            {
+                // 기존 활성 세션 재개
+                _currentSession = existingSession;
+                StatusUpdate?.Invoke(this, $"기존 세션 재개: {existingSession.Id}");
+
+                // 기존 메시지 히스토리 로드
+                await LoadMessageHistoryAsync(_currentSession.Id);
+            }
+            else
+            {
+                // 새 세션 생성 (시리얼 번호를 세션 ID로 사용)
+                var sessionId = GenerateClaimBasedSessionId(serialNumber);
+
+                _currentSession = new ChatSession
+                {
+                    Id = sessionId,
+                    Customer = customer ?? new Customer { SerialNumber = serialNumber },
+                    Status = SessionStatus.Online,
+                    StartedAt = DateTime.UtcNow,
+                    LastActivity = DateTime.UtcNow
+                };
+
+                // 서버에 새 세션 생성
+                var createResponse = await _apiService.CreateSessionAsync(_currentSession);
+                if (createResponse.Success)
+                {
+                    StatusUpdate?.Invoke(this, $"새 클레임 세션 생성됨: {sessionId}");
+                }
+                else
+                {
+                    StatusUpdate?.Invoke(this, $"세션 생성 실패: {createResponse.Message} (로컬에서 계속)");
+                }
+            }
+
             SessionStatusChanged?.Invoke(this, _currentSession);
-            
-            return Task.FromResult(true);
+            return true;
         }
         catch (Exception ex)
         {
             StatusUpdate?.Invoke(this, $"세션 시작 실패: {ex.Message}");
-            return Task.FromResult(false);
+            return false;
+        }
+    }
+
+    public async Task<bool> JoinExistingSessionAsync(ChatSession existingSession)
+    {
+        try
+        {
+            // 기존 세션을 현재 세션으로 설정
+            _currentSession = existingSession;
+
+            // 기존 메시지 히스토리 로드
+            await LoadMessageHistoryAsync(_currentSession.Id);
+
+            StatusUpdate?.Invoke(this, $"기존 세션 참여: {_currentSession.Id}");
+            SessionStatusChanged?.Invoke(this, _currentSession);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            StatusUpdate?.Invoke(this, $"세션 참여 실패: {ex.Message}");
+            return false;
         }
     }
 
@@ -63,6 +111,10 @@ public class SessionService
 
         try
         {
+            // 한국 시간으로 메시지 타임스탬프 설정
+            var koreaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Korea Standard Time");
+            var koreaTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, koreaTimeZone);
+
             var message = new ChatMessage
             {
                 Id = Guid.NewGuid().ToString(),
@@ -70,22 +122,26 @@ public class SessionService
                 Content = content,
                 Sender = sender ?? (_currentSession.Customer?.SerialNumber ?? "Unknown"),
                 Type = type,
-                Timestamp = DateTime.UtcNow,
+                Timestamp = koreaTime, // 한국 시간으로 설정
                 IsFromStaff = type == MessageType.Staff
             };
 
+            // 먼저 로컬에 메시지 추가 (사용자 경험 개선)
+            _messageHistory.Add(message);
+            MessageReceived?.Invoke(this, message);
+            _currentSession.LastActivity = DateTime.UtcNow;
+
             var response = await _apiService.SendMessageAsync(message);
-            
+
             if (response.Success)
             {
-                _messageHistory.Add(message);
-                MessageReceived?.Invoke(this, message);
-                _currentSession.LastActivity = DateTime.UtcNow;
+                StatusUpdate?.Invoke(this, "메시지 서버 전송 완료");
                 return true;
             }
             else
             {
-                StatusUpdate?.Invoke(this, $"메시지 전송 실패: {response.Message}");
+                StatusUpdate?.Invoke(this, $"서버 전송 실패: {response.Message}");
+                // 서버 전송은 실패했지만 로컬 표시는 성공
                 return false;
             }
         }
@@ -141,13 +197,17 @@ public class SessionService
 
         try
         {
+            StatusUpdate?.Invoke(this, $"메시지 동기화 중... (세션: {_currentSession.Id})");
             var response = await _apiService.GetChatHistoryAsync(_currentSession.Id);
-            
+
             if (response.Success && response.Data != null)
             {
                 var newMessages = response.Data
                     .Where(m => !_messageHistory.Any(existing => existing.Id == m.Id))
                     .OrderBy(m => m.Timestamp);
+
+                var newMessageCount = newMessages.Count();
+                StatusUpdate?.Invoke(this, $"새 메시지 {newMessageCount}개 발견");
 
                 foreach (var message in newMessages)
                 {
@@ -162,12 +222,62 @@ public class SessionService
 
                     _messageHistory.Add(message);
                     MessageReceived?.Invoke(this, message);
+                    StatusUpdate?.Invoke(this, $"새 메시지 수신: {message.Sender} - {message.Content}");
                 }
+
+                if (newMessageCount == 0)
+                {
+                    StatusUpdate?.Invoke(this, "새 메시지 없음");
+                }
+            }
+            else
+            {
+                StatusUpdate?.Invoke(this, $"메시지 동기화 실패: {response.Message}");
             }
         }
         catch (Exception ex)
         {
             StatusUpdate?.Invoke(this, $"메시지 동기화 오류: {ex.Message}");
+        }
+    }
+
+    // 수동 메시지 동기화
+    public async Task ManualSyncMessagesAsync()
+    {
+        await Task.Run(() => SyncMessages(null));
+    }
+
+    public async Task<bool> CompleteClaimAsync(string reason = "클레임 해결됨")
+    {
+        if (_currentSession == null) return false;
+
+        try
+        {
+            // 클레임 완료 메시지 추가
+            await SendMessageAsync($"[시스템] {reason}", MessageType.System);
+
+            // 세션 정보 업데이트
+            _currentSession.Status = SessionStatus.Completed;
+            _currentSession.EndedAt = DateTime.UtcNow;
+            _currentSession.LastActivity = DateTime.UtcNow;
+
+            // 서버에 세션 업데이트
+            var updateResponse = await _apiService.UpdateSessionAsync(_currentSession);
+            if (updateResponse.Success)
+            {
+                StatusUpdate?.Invoke(this, $"클레임 완료: {reason}");
+                return true;
+            }
+            else
+            {
+                StatusUpdate?.Invoke(this, $"서버 업데이트 실패: {updateResponse.Message} (로컬 완료됨)");
+                return true; // 로컬에서는 완료된 상태
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusUpdate?.Invoke(this, $"클레임 완료 오류: {ex.Message}");
+            return false;
         }
     }
 
@@ -185,11 +295,66 @@ public class SessionService
         StatusUpdate?.Invoke(this, "세션 종료됨");
     }
 
-    private string GenerateSessionId(string serialNumber)
+    private string GenerateClaimBasedSessionId(string serialNumber)
     {
-        var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-        var guid = Guid.NewGuid().ToString()[..8];
-        return $"{serialNumber}_{timestamp}_{guid}";
+        // 클레임 기반 세션 ID: 시리얼번호_CLAIM_날짜
+        var date = DateTime.UtcNow.ToString("yyyyMMdd");
+        return $"{serialNumber}_CLAIM_{date}";
+    }
+
+    private async Task<ChatSession?> GetActiveSessionBySerialNumberAsync(string serialNumber)
+    {
+        try
+        {
+            var response = await _apiService.GetActiveSessionsAsync();
+
+            if (response.Success && response.Data != null)
+            {
+                return response.Data.FirstOrDefault(s =>
+                    s.Customer?.SerialNumber == serialNumber &&
+                    s.Status != SessionStatus.Completed);
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusUpdate?.Invoke(this, $"활성 세션 조회 오류: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    private async Task LoadMessageHistoryAsync(string sessionId)
+    {
+        try
+        {
+            var response = await _apiService.GetChatHistoryAsync(sessionId);
+
+            if (response.Success && response.Data != null)
+            {
+                _messageHistory.Clear();
+
+                foreach (var message in response.Data.OrderBy(m => m.Timestamp))
+                {
+                    if (message.Timestamp.Kind == DateTimeKind.Utc)
+                    {
+                        message.Timestamp = message.Timestamp.ToLocalTime();
+                    }
+                    else if (message.Timestamp.Kind == DateTimeKind.Unspecified)
+                    {
+                        message.Timestamp = DateTime.SpecifyKind(message.Timestamp, DateTimeKind.Utc).ToLocalTime();
+                    }
+
+                    _messageHistory.Add(message);
+                    MessageReceived?.Invoke(this, message);
+                }
+
+                StatusUpdate?.Invoke(this, $"메시지 히스토리 로드됨: {_messageHistory.Count}개");
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusUpdate?.Invoke(this, $"히스토리 로드 오류: {ex.Message}");
+        }
     }
 
     public void Dispose()
