@@ -6,10 +6,10 @@ namespace ChatSupporter.Forms;
 public partial class SessionManagerForm : Form
 {
     private readonly GoogleAppsScriptService _apiService;
-    private List<ChatSession> _activeSessions = new();
+    private List<CustomerSession> _activeSessions = new();
     private System.Windows.Forms.Timer? _refreshTimer;
 
-    public event EventHandler<ChatSession>? SessionSelected;
+    public event EventHandler<CustomerSession>? SessionSelected;
 
     public SessionManagerForm(GoogleAppsScriptService apiService)
     {
@@ -35,7 +35,7 @@ public partial class SessionManagerForm : Form
     private void SetupRefreshTimer()
     {
         _refreshTimer = new System.Windows.Forms.Timer();
-        _refreshTimer.Interval = 10000; // 10초마다 갱신
+        _refreshTimer.Interval = 30000; // 30초마다 갱신 (세션 선택 방해 최소화)
         _refreshTimer.Tick += async (s, e) => await LoadSessionsAsync();
         _refreshTimer.Start();
     }
@@ -56,19 +56,23 @@ public partial class SessionManagerForm : Form
                 this.Invoke(() => SessionStatusLabel.Text = message);
             });
 
-            var response = await _apiService.GetActiveSessionsAsync(progress);
-            if (response.Success && response.Data != null)
+            // 서버에서 활성 세션 조회
+            var chatSessionResponse = await _apiService.GetActiveSessionsAsync(progress);
+            if (chatSessionResponse.Success && chatSessionResponse.Data != null)
             {
+                // ChatSession을 CustomerSession으로 변환
+                var customerSessions = ConvertChatSessionsToCustomerSessions(chatSessionResponse.Data);
+
                 // 서버에서 받은 세션에 시간 필터링 및 정렬 적용
-                _activeSessions = FilterAndSortSessions(response.Data);
-                SessionStatusLabel.Text = $"서버 세션: {_activeSessions.Count}개 (원본: {response.Data.Count}개)";
+                _activeSessions = FilterAndSortSessions(customerSessions);
+                SessionStatusLabel.Text = $"활성 세션: {_activeSessions.Count}개 (서버 연결됨)";
                 SessionStatusLabel.ForeColor = Color.Green;
             }
             else
             {
-                // 서버 실패 시 빈 목록
-                _activeSessions = new List<ChatSession>();
-                SessionStatusLabel.Text = $"서버 연결 실패: {response.Message}";
+                // 서버 실패 시 테스트 세션 표시
+                _activeSessions = CreateTestSessions();
+                SessionStatusLabel.Text = $"서버 연결 실패 - 테스트 세션: {_activeSessions.Count}개 ({chatSessionResponse.Message})";
                 SessionStatusLabel.ForeColor = Color.Red;
             }
 
@@ -77,15 +81,47 @@ public partial class SessionManagerForm : Form
         catch (Exception ex)
         {
             // 오류 발생 시 빈 목록
-            _activeSessions = new List<ChatSession>();
+            _activeSessions = new List<CustomerSession>();
             UpdateSessionList();
             SessionStatusLabel.Text = $"오류: {ex.Message}";
             SessionStatusLabel.ForeColor = Color.Red;
         }
     }
 
+    /// <summary>
+    /// ChatSession을 CustomerSession으로 변환
+    /// </summary>
+    private List<CustomerSession> ConvertChatSessionsToCustomerSessions(List<ChatSession> chatSessions)
+    {
+        var customerSessions = new List<CustomerSession>();
 
-    private List<ChatSession> SortSessions(List<ChatSession> sessions)
+        foreach (var chatSession in chatSessions)
+        {
+            var customerSession = new CustomerSession
+            {
+                SerialNumber = chatSession.Customer?.SerialNumber ?? chatSession.Id,
+                DeviceModel = chatSession.Customer?.DeviceModel ?? "알 수 없음",
+                CurrentSessionId = chatSession.Id,
+                Status = chatSession.Status,
+                IsOnline = chatSession.Status != SessionStatus.Offline && chatSession.Status != SessionStatus.Disconnected,
+                LastActivity = chatSession.LastActivity,
+                SessionStarted = chatSession.StartedAt,
+                AssignedStaff = chatSession.AssignedStaff ?? "",
+                CurrentClaimId = chatSession.CurrentClaimId ?? "",
+                TotalMessages = chatSession.Messages.Count,
+                LastHeartbeat = DateTime.UtcNow, // 현재 시간으로 설정
+                Priority = SessionPriority.Normal,
+                CreatedAt = chatSession.StartedAt,
+                UpdatedAt = DateTime.UtcNow
+            };
+
+            customerSessions.Add(customerSession);
+        }
+
+        return customerSessions;
+    }
+
+    private List<CustomerSession> SortSessions(List<CustomerSession> sessions)
     {
         return sessions
             .Where(s => s.Status != SessionStatus.Completed) // 완료된 세션 제외
@@ -94,7 +130,7 @@ public partial class SessionManagerForm : Form
             .ToList();
     }
 
-    private List<ChatSession> FilterAndSortSessions(List<ChatSession> sessions)
+    private List<CustomerSession> FilterAndSortSessions(List<CustomerSession> sessions)
     {
         // 임시로 1시간 필터 비활성화 - 모든 미완료 세션 표시
         var filteredSessions = sessions
@@ -141,18 +177,20 @@ public partial class SessionManagerForm : Form
 
         foreach (var session in _activeSessions)
         {
-            var displayName = string.IsNullOrEmpty(session.Customer?.SerialNumber)
-                ? $"고객 {session.Id[..Math.Min(8, session.Id.Length)]}"
-                : session.Customer.SerialNumber;
+            var displayName = string.IsNullOrEmpty(session.SerialNumber)
+                ? $"고객 {session.CurrentSessionId[..Math.Min(8, session.CurrentSessionId.Length)]}"
+                : session.SerialNumber;
 
             var item = new ListViewItem(displayName);
-            
+
             var statusText = session.Status switch
             {
+                SessionStatus.Offline => "오프라인",
                 SessionStatus.Online => "온라인",
                 SessionStatus.Waiting => "🚨 직원요청",
                 SessionStatus.Active => $"✅ 상담중 ({session.AssignedStaff ?? "미지정"})",
                 SessionStatus.Completed => "완료",
+                SessionStatus.Disconnected => "연결 끊김",
                 _ => session.Status.ToString()
             };
 
@@ -162,13 +200,17 @@ public partial class SessionManagerForm : Form
                 : session.AssignedStaff;
 
             item.SubItems.Add(statusText);
-            item.SubItems.Add(session.StartedAt.ToLocalTime().ToString("HH:mm"));
-            item.SubItems.Add(session.Messages.Count.ToString());
+            item.SubItems.Add(session.SessionStarted.ToLocalTime().ToString("HH:mm"));
+            item.SubItems.Add(session.TotalMessages.ToString());
             item.SubItems.Add(assignedStaff); // 담당 직원
             item.Tag = session;
 
             switch (session.Status)
             {
+                case SessionStatus.Offline:
+                    item.BackColor = Color.FromArgb(220, 220, 220);
+                    item.ForeColor = Color.Gray;
+                    break;
                 case SessionStatus.Online:
                     item.BackColor = Color.LightBlue;
                     break;
@@ -186,6 +228,10 @@ public partial class SessionManagerForm : Form
                 case SessionStatus.Completed:
                     item.BackColor = Color.FromArgb(220, 220, 220);
                     item.ForeColor = Color.Gray;
+                    break;
+                case SessionStatus.Disconnected:
+                    item.BackColor = Color.FromArgb(255, 182, 193); // 연한 분홍
+                    item.ForeColor = Color.DarkRed;
                     break;
                 default:
                     item.BackColor = Color.White;
@@ -205,7 +251,7 @@ public partial class SessionManagerForm : Form
     {
         if (SessionListView.SelectedItems.Count > 0)
         {
-            var session = SessionListView.SelectedItems[0].Tag as ChatSession;
+            var session = SessionListView.SelectedItems[0].Tag as CustomerSession;
             if (session != null)
             {
                 // 직원이 세션을 선택하면 담당 직원 자동 설정
@@ -254,5 +300,73 @@ public partial class SessionManagerForm : Form
     public void HideSessionManager()
     {
         this.Hide();
+    }
+
+    /// <summary>
+    /// GAS 비활성화 시 테스트용 세션 데이터 생성
+    /// </summary>
+    private List<CustomerSession> CreateTestSessions()
+    {
+        var testSessions = new List<CustomerSession>();
+        var now = DateTime.UtcNow;
+
+        // 테스트 세션 1: 고객 대기 중
+        testSessions.Add(new CustomerSession
+        {
+            SerialNumber = "LM1234",
+            DeviceModel = "L-CAM Pro",
+            CurrentSessionId = "LM1234_SESSION_001",
+            Status = SessionStatus.Waiting,
+            IsOnline = true,
+            LastActivity = now.AddMinutes(-5),
+            SessionStarted = now.AddMinutes(-10),
+            AssignedStaff = "",
+            CurrentClaimId = "",
+            TotalMessages = 3,
+            LastHeartbeat = now.AddMinutes(-1),
+            Priority = SessionPriority.High,
+            CreatedAt = now.AddMinutes(-10),
+            UpdatedAt = now.AddMinutes(-1)
+        });
+
+        // 테스트 세션 2: 상담 중
+        testSessions.Add(new CustomerSession
+        {
+            SerialNumber = "LM5678",
+            DeviceModel = "L-CAM Standard",
+            CurrentSessionId = "LM5678_SESSION_002",
+            Status = SessionStatus.Active,
+            IsOnline = true,
+            LastActivity = now.AddMinutes(-2),
+            SessionStarted = now.AddMinutes(-15),
+            AssignedStaff = "김직원",
+            CurrentClaimId = "",
+            TotalMessages = 8,
+            LastHeartbeat = now,
+            Priority = SessionPriority.Normal,
+            CreatedAt = now.AddMinutes(-15),
+            UpdatedAt = now.AddMinutes(-2)
+        });
+
+        // 테스트 세션 3: 온라인 대기
+        testSessions.Add(new CustomerSession
+        {
+            SerialNumber = "LM9999",
+            DeviceModel = "L-CAM Test",
+            CurrentSessionId = "LM9999_SESSION_003",
+            Status = SessionStatus.Online,
+            IsOnline = true,
+            LastActivity = now.AddMinutes(-1),
+            SessionStarted = now.AddMinutes(-3),
+            AssignedStaff = "",
+            CurrentClaimId = "",
+            TotalMessages = 1,
+            LastHeartbeat = now,
+            Priority = SessionPriority.Normal,
+            CreatedAt = now.AddMinutes(-3),
+            UpdatedAt = now.AddMinutes(-1)
+        });
+
+        return testSessions;
     }
 }

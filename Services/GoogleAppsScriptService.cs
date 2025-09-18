@@ -10,8 +10,11 @@ public class GoogleAppsScriptService
     private readonly string _apiUrl;
     private readonly int _maxRetries;
     private readonly int _timeoutSeconds;
+    private readonly bool _isEnabled;
 
-    public GoogleAppsScriptService(string apiUrl, int maxRetries = 3, int timeoutSeconds = 30)
+    public bool IsEnabled => _isEnabled;
+
+    public GoogleAppsScriptService(string apiUrl, int maxRetries = 3, int timeoutSeconds = 30, bool isEnabled = true)
     {
         // URI 유효성 검증
         if (string.IsNullOrWhiteSpace(apiUrl))
@@ -22,6 +25,7 @@ public class GoogleAppsScriptService
         _apiUrl = apiUrl.Trim();
         _maxRetries = maxRetries;
         _timeoutSeconds = timeoutSeconds;
+        _isEnabled = isEnabled;
 
         if (!Uri.TryCreate(_apiUrl, UriKind.Absolute, out var uri))
         {
@@ -128,7 +132,7 @@ public class GoogleAppsScriptService
                 {
                     Id = "msg1",
                     SessionId = sessionId,
-                    Content = "[고객] 화면이 제대로 보이지 않습니다.",
+                    Content = "화면이 제대로 보이지 않습니다.",
                     Sender = "LM1234",
                     Type = MessageType.User,
                     Timestamp = DateTime.Now.AddMinutes(-10),
@@ -138,7 +142,7 @@ public class GoogleAppsScriptService
                 {
                     Id = "msg2",
                     SessionId = sessionId,
-                    Content = "[고객] 렌즈를 교체했는데도 같은 문제가 발생합니다.",
+                    Content = "렌즈를 교체했는데도 같은 문제가 발생합니다.",
                     Sender = "LM1234",
                     Type = MessageType.User,
                     Timestamp = DateTime.Now.AddMinutes(-8),
@@ -148,10 +152,30 @@ public class GoogleAppsScriptService
                 {
                     Id = "msg3",
                     SessionId = sessionId,
-                    Content = "[시스템] 테스트 세션 시작됨 - ID: " + sessionId,
+                    Content = "테스트 세션이 시작되었습니다. ID: " + sessionId,
                     Sender = "System",
                     Type = MessageType.System,
-                    Timestamp = DateTime.Now.AddMinutes(-5),
+                    Timestamp = DateTime.Now.AddMinutes(-6),
+                    IsFromStaff = false
+                },
+                new ChatMessage
+                {
+                    Id = "msg4",
+                    SessionId = sessionId,
+                    Content = "안녕하세요! 문제를 해결해드리겠습니다.",
+                    Sender = "직원",
+                    Type = MessageType.Staff,
+                    Timestamp = DateTime.Now.AddMinutes(-4),
+                    IsFromStaff = true
+                },
+                new ChatMessage
+                {
+                    Id = "msg5",
+                    SessionId = sessionId,
+                    Content = "감사합니다. 빠른 도움 부탁드립니다.",
+                    Sender = "LM1234",
+                    Type = MessageType.User,
+                    Timestamp = DateTime.Now.AddMinutes(-2),
                     IsFromStaff = false
                 }
             };
@@ -322,6 +346,129 @@ public class GoogleAppsScriptService
     public async Task<ApiResponse<bool>> UpdateSessionStatusAsync(string sessionId, SessionStatus status, IProgress<string>? progress = null)
     {
         return await SendRequestAsync<bool>("updateSessionStatus", new { sessionId, status = status.ToString() }, progress);
+    }
+
+    // CustomerSession 관련 API 메서드들
+
+    /// <summary>
+    /// 고객 세션 조회 (단일 레코드)
+    /// </summary>
+    public async Task<ApiResponse<CustomerSession>> GetCustomerSessionAsync(string serialNumber, IProgress<string>? progress = null)
+    {
+        var result = await SendRequestAsync<CustomerSession>("getCustomerSession", new { serialNumber }, progress);
+
+        // API 실패시 새 CustomerSession 반환 (신규 고객)
+        if (!result.Success)
+        {
+            progress?.Report($"신규 고객 세션 생성: {serialNumber}");
+
+            return new ApiResponse<CustomerSession>
+            {
+                Success = true,
+                Message = "신규 고객 세션",
+                Data = null // null을 반환하여 새 세션 생성 유도
+            };
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 고객 세션 생성 또는 업데이트
+    /// </summary>
+    public async Task<ApiResponse<CustomerSession>> CreateOrUpdateCustomerSessionAsync(CustomerSession session, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<CustomerSession>("createOrUpdateCustomerSession", session, progress);
+    }
+
+    /// <summary>
+    /// 활성 고객 세션 목록 조회 (실시간 대시보드용)
+    /// </summary>
+    public async Task<ApiResponse<List<CustomerSession>>> GetActiveCustomerSessionsAsync(IProgress<string>? progress = null)
+    {
+        var result = await SendRequestAsync<List<CustomerSession>>("getActiveCustomerSessions", new { }, progress);
+
+        // API 실패시 테스트용 목업 데이터 반환
+        if (!result.Success)
+        {
+            progress?.Report("API 실패 - 테스트용 목업 고객 세션 데이터 사용");
+
+            var mockCustomerSessions = new List<CustomerSession>
+            {
+                new CustomerSession
+                {
+                    SerialNumber = "LM1234",
+                    DeviceModel = "L-CAM_TEST",
+                    CurrentSessionId = "LM1234_SESSION_20250917203000",
+                    Status = SessionStatus.Online,
+                    IsOnline = true,
+                    LastActivity = DateTime.UtcNow.AddMinutes(-2),
+                    LastHeartbeat = DateTime.UtcNow.AddSeconds(-30),
+                    Priority = SessionPriority.Normal,
+                    TotalMessages = 5,
+                    AssignedStaff = ""
+                },
+                new CustomerSession
+                {
+                    SerialNumber = "LM5678",
+                    DeviceModel = "L-CAM_PRO",
+                    CurrentSessionId = "LM5678_SESSION_20250917202800",
+                    Status = SessionStatus.Waiting,
+                    IsOnline = true,
+                    LastActivity = DateTime.UtcNow.AddMinutes(-1),
+                    LastHeartbeat = DateTime.UtcNow.AddSeconds(-45),
+                    Priority = SessionPriority.High,
+                    TotalMessages = 3,
+                    AssignedStaff = ""
+                },
+                new CustomerSession
+                {
+                    SerialNumber = "LM9999",
+                    DeviceModel = "L-CAM_BASIC",
+                    CurrentSessionId = "LM9999_SESSION_20250917201500",
+                    Status = SessionStatus.Active,
+                    IsOnline = true,
+                    LastActivity = DateTime.UtcNow.AddMinutes(-5),
+                    LastHeartbeat = DateTime.UtcNow.AddMinutes(-6), // 비활성 상태
+                    Priority = SessionPriority.Normal,
+                    TotalMessages = 12,
+                    AssignedStaff = "김직원"
+                }
+            };
+
+            return new ApiResponse<List<CustomerSession>>
+            {
+                Success = true,
+                Message = "목업 고객 세션 데이터 로드됨",
+                Data = mockCustomerSessions
+            };
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 세션 히스토리 저장
+    /// </summary>
+    public async Task<ApiResponse<SessionHistory>> SaveSessionHistoryAsync(SessionHistory history, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<SessionHistory>("saveSessionHistory", history, progress);
+    }
+
+    /// <summary>
+    /// 고객별 세션 히스토리 조회
+    /// </summary>
+    public async Task<ApiResponse<List<SessionHistory>>> GetCustomerSessionHistoryAsync(string serialNumber, int limit = 10, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<List<SessionHistory>>("getCustomerSessionHistory", new { serialNumber, limit }, progress);
+    }
+
+    /// <summary>
+    /// 하트비트 업데이트 (경량화된 API)
+    /// </summary>
+    public async Task<ApiResponse<bool>> UpdateHeartbeatAsync(string serialNumber, IProgress<string>? progress = null)
+    {
+        return await SendRequestAsync<bool>("updateHeartbeat", new { serialNumber, timestamp = DateTime.UtcNow }, progress);
     }
 
     public void Dispose()

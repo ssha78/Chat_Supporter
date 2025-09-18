@@ -39,9 +39,10 @@ public class ChatSession
 
 public enum SessionStatus
 {
-    Online,
-    Waiting,
-    Active,
-    Completed,
-    Disconnected
+    Offline,        // 오프라인
+    Online,         // 온라인 대기
+    Waiting,        // 직원 요청
+    Active,         // 상담 진행 중
+    Completed,      // 완료
+    Disconnected    // 연결 끊김
 }

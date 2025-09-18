@@ -7,7 +7,7 @@ public partial class MainForm : Form
 {
     private readonly ConfigurationService _configService;
     private readonly GoogleAppsScriptService _apiService;
-    private readonly SessionService _sessionService;
+    private readonly CustomerSessionService _sessionService;
     private readonly DeviceDetectionService _deviceService;
     private readonly DebugLogService _debugLog;
 
@@ -27,9 +27,10 @@ public partial class MainForm : Form
         _apiService = new GoogleAppsScriptService(
             _configService.Settings.GoogleAppsScript.ChatApiUrl,
             _configService.Settings.GoogleAppsScript.MaxRetries,
-            _configService.Settings.GoogleAppsScript.TimeoutSeconds
+            _configService.Settings.GoogleAppsScript.TimeoutSeconds,
+            _configService.Settings.GoogleAppsScript.Enabled
         );
-        _sessionService = new SessionService(_apiService, _configService, _debugLog);
+        _sessionService = new CustomerSessionService(_apiService, _configService, _debugLog);
         _deviceService = new DeviceDetectionService();
 
         SetupForm();
@@ -63,13 +64,7 @@ public partial class MainForm : Form
             var device = devices.First();
             _currentSerialNumber = device.SerialNumber;
             
-            var customer = new Customer
-            {
-                SerialNumber = device.SerialNumber,
-                DeviceModel = device.DeviceModel
-            };
-            
-            _ = _sessionService.StartSessionAsync(_currentSerialNumber, customer);
+            _ = _sessionService.StartOrResumeSessionAsync(_currentSerialNumber, device.DeviceModel);
             
             StatusLabel.Text = $"장치 연결됨: {device.SerialNumber}";
             StatusLabel.ForeColor = Color.Green;
@@ -89,13 +84,7 @@ public partial class MainForm : Form
             {
                 _currentSerialNumber = device.SerialNumber;
                 
-                var customer = new Customer
-                {
-                    SerialNumber = device.SerialNumber,
-                    DeviceModel = device.DeviceModel
-                };
-                
-                _ = _sessionService.StartSessionAsync(_currentSerialNumber, customer);
+                _ = _sessionService.StartOrResumeSessionAsync(_currentSerialNumber, device.DeviceModel);
                 
                 StatusLabel.Text = $"장치 연결됨: {device.SerialNumber}";
                 StatusLabel.ForeColor = Color.Green;
@@ -111,7 +100,7 @@ public partial class MainForm : Form
         });
     }
 
-    private void OnSessionStatusChanged(object? sender, ChatSession session)
+    private void OnSessionStatusChanged(object? sender, CustomerSession session)
     {
         this.Invoke(() =>
         {
@@ -154,21 +143,28 @@ public partial class MainForm : Form
     private void AddMessageToChat(ChatMessage message)
     {
         var displayText = $"[{message.Timestamp:HH:mm}] ";
-        
+
         if (message.Type == MessageType.System)
         {
             displayText += "[시스템] ";
         }
-        else if (message.IsFromStaff)
+        else if (message.Type == MessageType.Staff || message.IsFromStaff)
         {
             displayText += "[직원] ";
         }
+        else if (message.Type == MessageType.User)
+        {
+            displayText += "[고객] ";
+        }
         else
         {
+            // 기타 메시지 타입이나 fallback
             displayText += $"[{message.Sender}] ";
         }
-        
+
         displayText += message.Content;
+
+        _debugLog.LogUI("메시지 표시", $"타입: {message.Type}, IsFromStaff: {message.IsFromStaff}, 표시: {displayText}");
         
         ChatListBox.Items.Add(displayText);
         ChatListBox.TopIndex = ChatListBox.Items.Count - 1;
@@ -188,7 +184,7 @@ public partial class MainForm : Form
         try
         {
             var messageType = _isStaffMode ? MessageType.Staff : MessageType.User;
-            var success = await _sessionService.SendMessageAsync(message, messageType);
+            var success = await _sessionService.SendMessageAsync(message, messageType, _isStaffMode ? "직원" : _currentSerialNumber);
 
             if (!success)
             {
@@ -219,11 +215,10 @@ public partial class MainForm : Form
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        // Ctrl+S로 수동 동기화
+        // Ctrl+S로 수동 동기화 (CustomerSessionService에서는 자동 동기화)
         if (keyData == (Keys.Control | Keys.S))
         {
-            _ = _sessionService.ManualSyncMessagesAsync();
-            StatusLabel.Text = "수동 동기화 실행됨";
+            StatusLabel.Text = "동기화는 자동으로 실행됩니다";
             return true;
         }
 
@@ -237,7 +232,7 @@ public partial class MainForm : Form
             var success = await _sessionService.UpdateSessionStatusAsync(SessionStatus.Waiting);
             if (success)
             {
-                await _sessionService.SendMessageAsync("고객이 직원 연결을 요청했습니다.", MessageType.System);
+                await _sessionService.SendMessageAsync("고객이 직원 연결을 요청했습니다.", MessageType.System, "시스템");
                 ConnectToStaffButton.Enabled = false;
                 ConnectToStaffButton.Text = "직원 요청됨";
             }
@@ -276,7 +271,7 @@ public partial class MainForm : Form
     {
         if (_sessionService.CurrentSession != null)
         {
-            _sessionService.EndSession();
+            await _sessionService.EndSessionAsync("테스트 세션 종료");
             TestSessionButton.Text = "테스트 세션";
             TestSessionButton.BackColor = Color.LightGreen;
             CompleteClaimButton.Enabled = false;
@@ -285,13 +280,7 @@ public partial class MainForm : Form
         {
             _currentSerialNumber = "LM1234";
 
-            var customer = new Customer
-            {
-                SerialNumber = _currentSerialNumber,
-                DeviceModel = "L-CAM_TEST"
-            };
-
-            var success = await _sessionService.StartSessionAsync(_currentSerialNumber, customer);
+            var success = await _sessionService.StartOrResumeSessionAsync(_currentSerialNumber, "L-CAM_TEST");
             if (success)
             {
                 TestSessionButton.Text = "세션 종료";
@@ -299,23 +288,6 @@ public partial class MainForm : Form
                 CompleteClaimButton.Enabled = true;
                 StatusLabel.Text = $"테스트 세션 시작됨: {_currentSerialNumber}";
                 StatusLabel.ForeColor = Color.Green;
-
-                // 세션 시작 확인 메시지 추가
-                var sessionInfo = _sessionService.CurrentSession;
-                if (sessionInfo != null)
-                {
-                    var startMessage = new ChatMessage
-                    {
-                        Id = Guid.NewGuid().ToString(),
-                        SessionId = sessionInfo.Id,
-                        Content = $"[시스템] 테스트 세션 시작됨 - ID: {sessionInfo.Id}",
-                        Sender = "System",
-                        Type = MessageType.System,
-                        Timestamp = DateTime.Now,
-                        IsFromStaff = false
-                    };
-                    AddMessageToChat(startMessage);
-                }
             }
             else
             {
@@ -340,7 +312,11 @@ public partial class MainForm : Form
             CompleteClaimButton.Enabled = false;
             CompleteClaimButton.Text = "완료 중...";
 
-            var success = await _sessionService.CompleteClaimAsync("클레임이 해결되어 완료되었습니다.");
+            var success = await _sessionService.UpdateSessionStatusAsync(SessionStatus.Completed);
+            if (success)
+            {
+                await _sessionService.SendMessageAsync("클레임이 해결되어 완료되었습니다.", MessageType.System, "시스템");
+            }
 
             if (success)
             {
@@ -375,14 +351,17 @@ public partial class MainForm : Form
         _sessionManager?.HideSessionManager();
     }
 
-    private async void OnSessionSelected(object? sender, ChatSession session)
+    private async void OnSessionSelected(object? sender, CustomerSession selectedSession)
     {
-        if (_sessionService.CurrentSession?.Id != session.Id)
+        if (_sessionService.CurrentSession?.SerialNumber != selectedSession.SerialNumber)
         {
-            _debugLog.LogUI("직원 세션 선택", $"세션 ID: {session.Id}, 고객: {session.Customer?.SerialNumber}");
+            _debugLog.LogUI("직원 세션 선택", $"고객: {selectedSession.SerialNumber}");
 
             // 기존 세션 종료
-            _sessionService.EndSession();
+            if (_sessionService.CurrentSession != null)
+            {
+                await _sessionService.EndSessionAsync("직원이 다른 세션으로 전환");
+            }
 
             // 채팅창 클리어 (새 세션 메시지 로딩 전에)
             ChatListBox.Items.Clear();
@@ -390,34 +369,27 @@ public partial class MainForm : Form
             StatusLabel.Text = "세션 연결 중...";
             StatusLabel.ForeColor = Color.Orange;
 
-            // 선택된 세션으로 직접 전환 (새로 생성하지 않고)
-            _currentSerialNumber = session.Customer?.SerialNumber ?? session.Id;
-            var success = await _sessionService.JoinExistingSessionAsync(session);
+            // 선택된 세션으로 직접 전환 - 이제 CustomerSession 객체를 직접 사용
+            _currentSerialNumber = selectedSession.SerialNumber;
 
-            if (success)
-            {
-                _debugLog.LogUI("세션 연결 성공", $"세션 ID: {session.Id}");
-                this.Text = $"Chat Supporter - {session.Customer?.SerialNumber ?? "Unknown"} (직원모드)";
+            // 세션 객체를 직접 설정하여 서버 조회를 건너뛰기
+            _sessionService.SetCurrentSession(selectedSession);
 
-                // 세션 상태 UI 업데이트
-                if (_sessionService.CurrentSession != null)
-                {
-                    CompleteClaimButton.Enabled = _sessionService.CurrentSession.Status != SessionStatus.Completed;
-                }
+            // 메시지 히스토리 로드
+            await _sessionService.LoadMessageHistoryForSession(selectedSession.CurrentSessionId);
 
-                StatusLabel.Text = $"세션 연결 완료: {session.Id}";
-                StatusLabel.ForeColor = Color.Green;
-            }
-            else
-            {
-                _debugLog.LogError("세션 연결 실패", $"세션 ID: {session.Id}");
-                StatusLabel.Text = "세션 전환 실패";
-                StatusLabel.ForeColor = Color.Red;
-            }
+            _debugLog.LogUI("세션 연결 성공", $"고객: {selectedSession.SerialNumber}");
+            this.Text = $"Chat Supporter - {selectedSession.SerialNumber} (직원모드)";
+
+            // 세션 상태 UI 업데이트
+            CompleteClaimButton.Enabled = selectedSession.Status != SessionStatus.Completed;
+
+            StatusLabel.Text = $"세션 연결 완료: {selectedSession.SerialNumber}";
+            StatusLabel.ForeColor = Color.Green;
         }
         else
         {
-            _debugLog.LogUI("동일 세션 선택", $"이미 연결된 세션: {session.Id}");
+            _debugLog.LogUI("동일 세션 선택", $"이미 연결된 세션: {selectedSession.SerialNumber}");
         }
     }
 
