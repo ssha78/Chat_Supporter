@@ -29,8 +29,6 @@ public class CustomerSessionService
         _configService = configService;
         _debugLog = debugLog;
 
-        _debugLog.LogSession("CustomerSessionService 초기화", "시작");
-
         // 하트비트 타이머 (30초마다)
         var heartbeatInterval = TimeSpan.FromSeconds(30);
         _heartbeatTimer = new System.Threading.Timer(SendHeartbeat, null, heartbeatInterval, heartbeatInterval);
@@ -39,7 +37,7 @@ public class CustomerSessionService
         var refreshInterval = TimeSpan.FromSeconds(Math.Max(2, _configService.Settings.Chat.RefreshIntervalSeconds));
         _syncTimer = new System.Threading.Timer(SyncMessages, null, refreshInterval, refreshInterval);
 
-        _debugLog.LogSession("CustomerSessionService 초기화", $"완료 - 하트비트: {heartbeatInterval.TotalSeconds}초, 동기화: {refreshInterval.TotalSeconds}초");
+        _debugLog.LogSession("서비스 초기화", $"CustomerSessionService 준비완료 - 하트비트: {heartbeatInterval.TotalSeconds}초, 동기화: {refreshInterval.TotalSeconds}초");
     }
 
     /// <summary>
@@ -340,10 +338,50 @@ public class CustomerSessionService
 
             await CreateOrUpdateCustomerSessionAsync(_currentCustomerSession);
 
+            // 서버의 ChatSession 상태를 Offline로 업데이트
+            var statusUpdateResponse = await _apiService.UpdateSessionStatusAsync(_currentCustomerSession.CurrentSessionId, SessionStatus.Offline);
+            if (statusUpdateResponse.Success)
+            {
+                _debugLog.LogSession("서버 세션 상태 업데이트", _currentCustomerSession.SerialNumber, "Offline으로 변경 성공");
+            }
+            else
+            {
+                _debugLog.LogError("서버 세션 상태 업데이트", statusUpdateResponse.Message);
+            }
+
+            // 서버에 세션 종료 알림 메시지 전송
+            var offlineMessage = new ChatMessage
+            {
+                Id = Guid.NewGuid().ToString(),
+                SessionId = _currentCustomerSession.CurrentSessionId,
+                Content = $"세션 종료 - {reason}",
+                Sender = "System",
+                Type = MessageType.System,
+                Timestamp = DateTime.UtcNow,
+                IsFromStaff = false
+            };
+
+            // 서버에만 전송 (로컬 메시지 히스토리에는 추가하지 않음)
+            var messageResponse = await _apiService.SendMessageAsync(offlineMessage);
+            if (messageResponse.Success)
+            {
+                _debugLog.LogSession("서버 종료 메시지 전송", _currentCustomerSession.SerialNumber, "성공");
+            }
+            else
+            {
+                _debugLog.LogError("서버 종료 메시지 전송", messageResponse.Message);
+            }
+
             _debugLog.LogSession("세션 종료", _currentCustomerSession.SerialNumber, reason);
 
+            // UI 업데이트를 위한 상태 변경 이벤트 발생
+            var closedSession = _currentCustomerSession;
             _currentCustomerSession = null;
             _messageHistory.Clear();
+
+            // 세션 종료 상태 알림
+            SessionStatusChanged?.Invoke(this, null!);
+            StatusUpdate?.Invoke(this, "세션이 종료되었습니다");
         }
         catch (Exception ex)
         {

@@ -136,39 +136,49 @@ public partial class SessionManagerForm : Form
         var filteredSessions = sessions
             .Where(s => s.Status != SessionStatus.Completed); // 완료된 세션만 제외
 
-        // 한국 시간 기준으로 1시간 전 계산 (로깅용)
-        var koreaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Korea Standard Time");
-        var koreaTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, koreaTimeZone);
-        var oneHourAgo = koreaTime.AddHours(-1);
+        // 장비별로 그룹화하여 최신 세션만 표시
+        var groupedSessions = filteredSessions
+            .GroupBy(s => s.SerialNumber)
+            .Select(group => {
+                // 각 장비의 세션들을 최근 활동순으로 정렬하여 가장 최신 세션을 선택
+                var latestSession = group
+                    .OrderByDescending(s => s.Status == SessionStatus.Waiting ? 1 : 0) // 직원 요청 세션 최우선
+                    .ThenByDescending(s => s.LastActivity) // 최근 활동순
+                    .First();
 
-        // 시간 필터링 비활성화됨
-        /*
-        var filteredSessions = sessions
-            .Where(s => s.Status != SessionStatus.Completed) // 완료된 세션 제외
-            .Where(s =>
-            {
-                // 세션 시간을 한국 시간으로 변환하여 비교
-                var sessionLastActivity = s.LastActivity.Kind == DateTimeKind.Utc
-                    ? TimeZoneInfo.ConvertTimeFromUtc(s.LastActivity, koreaTimeZone)
-                    : s.LastActivity;
+                // 해당 장비의 총 세션 수와 총 메시지 수 계산
+                var totalSessions = group.Count();
+                var totalMessages = group.Sum(s => s.TotalMessages);
 
-                var sessionStartTime = s.StartedAt.Kind == DateTimeKind.Utc
-                    ? TimeZoneInfo.ConvertTimeFromUtc(s.StartedAt, koreaTimeZone)
-                    : s.StartedAt;
+                // 복사본 생성하여 수정 (원본 객체 변경 방지)
+                var groupedSession = new CustomerSession
+                {
+                    SerialNumber = latestSession.SerialNumber,
+                    DeviceModel = totalSessions > 1 ? $"{latestSession.DeviceModel} ({totalSessions}개 세션)" : latestSession.DeviceModel,
+                    CurrentSessionId = latestSession.CurrentSessionId,
+                    Status = latestSession.Status,
+                    IsOnline = latestSession.IsOnline,
+                    LastActivity = latestSession.LastActivity,
+                    SessionStarted = latestSession.SessionStarted,
+                    AssignedStaff = latestSession.AssignedStaff,
+                    CurrentClaimId = latestSession.CurrentClaimId,
+                    TotalMessages = totalMessages, // 모든 세션의 메시지 합계
+                    LastHeartbeat = latestSession.LastHeartbeat,
+                    Priority = latestSession.Priority,
+                    CreatedAt = latestSession.CreatedAt,
+                    UpdatedAt = latestSession.UpdatedAt
+                };
 
-                return sessionLastActivity >= oneHourAgo || sessionStartTime >= oneHourAgo;
+                return groupedSession;
             })
-        */
-
-        var sortedSessions = filteredSessions
             .OrderByDescending(s => s.Status == SessionStatus.Waiting ? 1 : 0) // 직원 요청 세션 최우선
             .ThenByDescending(s => s.LastActivity) // 최근 활동순
             .ToList();
 
         // 디버그 정보 추가
-        SessionStatusLabel.Text += $" (1시간 필터 비활성화됨)";
+        SessionStatusLabel.Text += $" (장비별 그룹화 적용)";
 
-        return sortedSessions;
+        return groupedSessions;
     }
 
     private void UpdateSessionList()
@@ -247,31 +257,85 @@ public partial class SessionManagerForm : Form
         _ = LoadSessionsAsync();
     }
 
-    private void SessionListView_DoubleClick(object? sender, EventArgs e)
+    private async void SessionListView_DoubleClick(object? sender, EventArgs e)
     {
         if (SessionListView.SelectedItems.Count > 0)
         {
             var session = SessionListView.SelectedItems[0].Tag as CustomerSession;
             if (session != null)
             {
-                // 직원이 세션을 선택하면 담당 직원 자동 설정
-                if (string.IsNullOrEmpty(session.AssignedStaff))
+                // 서버 기반 세션 할당 처리
+                await HandleSessionAssignmentAsync(session);
+            }
+        }
+    }
+
+    private async Task HandleSessionAssignmentAsync(CustomerSession session)
+    {
+        var staffId = "김직원"; // 추후 로그인 시스템으로 변경 예정
+
+        try
+        {
+            // UI 즉시 업데이트 (응답성 향상)
+            SessionStatusLabel.Text = $"세션 할당 중... ({session.SerialNumber})";
+            SessionStatusLabel.ForeColor = Color.Orange;
+
+            // 이미 할당된 세션인지 확인
+            if (!string.IsNullOrEmpty(session.AssignedStaff))
+            {
+                // 이미 할당된 세션 - 바로 선택
+                SessionSelected?.Invoke(this, session);
+                SessionStatusLabel.Text = $"세션 연결됨: {session.SerialNumber} (기존 할당)";
+                SessionStatusLabel.ForeColor = Color.Green;
+                return;
+            }
+
+            // 서버에 세션 할당 요청
+            var assignmentResult = await _apiService.AssignStaffToSessionAsync(
+                session.CurrentSessionId,
+                staffId,
+                staffId
+            );
+
+            if (assignmentResult.Success && assignmentResult.Data != null)
+            {
+                // 할당 성공 - 로컬 세션 정보 업데이트
+                session.AssignedStaff = staffId;
+
+                // 세션 상태를 Active로 변경 (서버에서 이미 처리됨)
+                if (session.Status == SessionStatus.Waiting || session.Status == SessionStatus.Online)
                 {
-                    // 기본 직원 이름 설정 (나중에 설정 파일이나 로그인 시스템으로 변경 가능)
-                    session.AssignedStaff = "김직원";
-
-                    // 세션 상태를 Active로 변경
-                    if (session.Status == SessionStatus.Waiting || session.Status == SessionStatus.Online)
-                    {
-                        session.Status = SessionStatus.Active;
-                    }
-
-                    // UI 업데이트
-                    UpdateSessionList();
+                    session.Status = SessionStatus.Active;
                 }
 
+                // UI 업데이트
+                UpdateSessionList();
                 SessionSelected?.Invoke(this, session);
+
+                SessionStatusLabel.Text = $"세션 할당 성공: {session.SerialNumber}";
+                SessionStatusLabel.ForeColor = Color.Green;
             }
+            else
+            {
+                // 할당 실패 (다른 직원이 이미 할당했거나 서버 오류)
+                var message = assignmentResult.Data?.AlreadyAssigned == true
+                    ? $"다른 직원({assignmentResult.Data.ConflictStaff})이 이미 담당하고 있습니다."
+                    : assignmentResult.Message ?? "세션 할당에 실패했습니다.";
+
+                MessageBox.Show(message, "세션 할당 실패", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+                SessionStatusLabel.Text = $"할당 실패: {message}";
+                SessionStatusLabel.ForeColor = Color.Red;
+
+                // 세션 목록 새로고침 (서버 상태와 동기화)
+                _ = LoadSessionsAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"세션 할당 중 오류가 발생했습니다: {ex.Message}", "오류", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            SessionStatusLabel.Text = $"오류: {ex.Message}";
+            SessionStatusLabel.ForeColor = Color.Red;
         }
     }
 

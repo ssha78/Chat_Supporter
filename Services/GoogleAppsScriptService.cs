@@ -471,6 +471,84 @@ public class GoogleAppsScriptService
         return await SendRequestAsync<bool>("updateHeartbeat", new { serialNumber, timestamp = DateTime.UtcNow }, progress);
     }
 
+    // =================== SESSION ASSIGNMENT API METHODS ===================
+
+    /// <summary>
+    /// 세션에 직원 할당 (동시성 안전)
+    /// </summary>
+    public async Task<ApiResponse<SessionAssignmentResult>> AssignStaffToSessionAsync(string sessionId, string staffId, string? staffName = null, IProgress<string>? progress = null)
+    {
+        progress?.Report($"세션 할당 요청: {sessionId} → {staffId}");
+
+        var requestData = new
+        {
+            sessionId = sessionId,
+            staffId = staffId,
+            staffName = staffName ?? staffId
+        };
+
+        var result = await SendRequestAsync<SessionAssignmentResult>("assignStaffToSession", requestData, progress);
+
+        if (result.Success)
+        {
+            progress?.Report($"세션 할당 성공: {sessionId} → {staffId}");
+        }
+        else
+        {
+            progress?.Report($"세션 할당 실패: {result.Message}");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 세션에서 직원 할당 해제
+    /// </summary>
+    public async Task<ApiResponse<SessionReleaseResult>> ReleaseStaffFromSessionAsync(string sessionId, string staffId, string? reason = null, IProgress<string>? progress = null)
+    {
+        progress?.Report($"세션 할당 해제 요청: {sessionId} from {staffId}");
+
+        var requestData = new
+        {
+            sessionId = sessionId,
+            staffId = staffId,
+            reason = reason ?? "세션 종료"
+        };
+
+        var result = await SendRequestAsync<SessionReleaseResult>("releaseStaffFromSession", requestData, progress);
+
+        if (result.Success)
+        {
+            progress?.Report($"세션 할당 해제 성공: {sessionId}");
+        }
+        else
+        {
+            progress?.Report($"세션 할당 해제 실패: {result.Message}");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 세션 할당 상태 확인
+    /// </summary>
+    public async Task<ApiResponse<SessionAssignmentStatus>> CheckSessionAssignmentAsync(string sessionId, IProgress<string>? progress = null)
+    {
+        progress?.Report($"세션 상태 확인: {sessionId}");
+
+        var requestData = new { sessionId = sessionId };
+
+        var result = await SendRequestAsync<SessionAssignmentStatus>("checkSessionAssignment", requestData, progress);
+
+        if (result.Success && result.Data != null)
+        {
+            var status = result.Data;
+            progress?.Report($"세션 상태: {status.Status}, 할당: {(status.IsAssigned ? status.AssignedStaff : "미할당")}");
+        }
+
+        return result;
+    }
+
     public void Dispose()
     {
         _httpClient?.Dispose();
@@ -483,4 +561,45 @@ public class ApiResponse<T>
     public string Message { get; set; } = string.Empty;
     public T? Data { get; set; }
     public DateTime Timestamp { get; set; } = DateTime.Now;
+}
+
+// =================== SESSION ASSIGNMENT DATA CLASSES ===================
+
+/// <summary>
+/// 세션 할당 결과
+/// </summary>
+public class SessionAssignmentResult
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string AssignedStaff { get; set; } = string.Empty;
+    public string StaffName { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public string AssignedAt { get; set; } = string.Empty;
+    public string PreviousStatus { get; set; } = string.Empty;
+    public bool AlreadyAssigned { get; set; }
+    public string? ConflictStaff { get; set; }
+}
+
+/// <summary>
+/// 세션 할당 해제 결과
+/// </summary>
+public class SessionReleaseResult
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string ReleasedFrom { get; set; } = string.Empty;
+    public string NewStatus { get; set; } = string.Empty;
+    public string Reason { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// 세션 할당 상태
+/// </summary>
+public class SessionAssignmentStatus
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string AssignedStaff { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public string AssignedAt { get; set; } = string.Empty;
+    public bool IsAssigned { get; set; }
+    public bool CanAssign { get; set; }
 }

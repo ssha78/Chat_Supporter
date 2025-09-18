@@ -100,10 +100,26 @@ public partial class MainForm : Form
         });
     }
 
-    private void OnSessionStatusChanged(object? sender, CustomerSession session)
+    private void OnSessionStatusChanged(object? sender, CustomerSession? session)
     {
         this.Invoke(() =>
         {
+            if (session == null)
+            {
+                // 세션 종료된 경우
+                SessionStatusLabel.Text = "세션 상태: 종료됨";
+                CompleteClaimButton.Enabled = false;
+                CompleteClaimButton.Text = "클레임 완료";
+                CompleteClaimButton.BackColor = SystemColors.Control;
+
+                // 테스트 세션 버튼 초기화
+                TestSessionButton.Text = "테스트 세션";
+                TestSessionButton.BackColor = Color.LightGreen;
+
+                // 채팅창 유지 (히스토리 보존)
+                return;
+            }
+
             var statusText = session.Status switch
             {
                 SessionStatus.Online => "온라인",
@@ -267,33 +283,64 @@ public partial class MainForm : Form
         }
     }
 
-    private async void TestSessionButton_Click(object? sender, EventArgs e)
+    private void TestSessionButton_Click(object? sender, EventArgs e)
     {
         if (_sessionService.CurrentSession != null)
         {
-            await _sessionService.EndSessionAsync("테스트 세션 종료");
-            TestSessionButton.Text = "테스트 세션";
-            TestSessionButton.BackColor = Color.LightGreen;
-            CompleteClaimButton.Enabled = false;
+            // 즉시 UI 업데이트 (응답성 향상)
+            TestSessionButton.Text = "종료 중...";
+            TestSessionButton.Enabled = false;
+            StatusLabel.Text = "세션 종료 중...";
+            StatusLabel.ForeColor = Color.Orange;
+
+            // 백그라운드에서 세션 종료 처리
+            _ = Task.Run(async () =>
+            {
+                await _sessionService.EndSessionAsync("테스트 세션 종료");
+
+                // UI 스레드에서 최종 상태 업데이트는 이벤트 핸들러에서 처리됨
+                this.Invoke(() =>
+                {
+                    TestSessionButton.Enabled = true;
+                });
+            });
         }
         else
         {
+            // 즉시 UI 업데이트 (응답성 향상)
+            TestSessionButton.Text = "시작 중...";
+            TestSessionButton.Enabled = false;
+            StatusLabel.Text = "테스트 세션 시작 중...";
+            StatusLabel.ForeColor = Color.Orange;
+
             _currentSerialNumber = "LM1234";
 
-            var success = await _sessionService.StartOrResumeSessionAsync(_currentSerialNumber, "L-CAM_TEST");
-            if (success)
+            // 백그라운드에서 세션 시작 처리
+            _ = Task.Run(async () =>
             {
-                TestSessionButton.Text = "세션 종료";
-                TestSessionButton.BackColor = Color.LightCoral;
-                CompleteClaimButton.Enabled = true;
-                StatusLabel.Text = $"테스트 세션 시작됨: {_currentSerialNumber}";
-                StatusLabel.ForeColor = Color.Green;
-            }
-            else
-            {
-                StatusLabel.Text = "세션 시작 실패";
-                StatusLabel.ForeColor = Color.Red;
-            }
+                var success = await _sessionService.StartOrResumeSessionAsync(_currentSerialNumber, "L-CAM_TEST");
+
+                this.Invoke(() =>
+                {
+                    TestSessionButton.Enabled = true;
+
+                    if (success)
+                    {
+                        TestSessionButton.Text = "세션 종료";
+                        TestSessionButton.BackColor = Color.LightCoral;
+                        CompleteClaimButton.Enabled = true;
+                        StatusLabel.Text = $"테스트 세션 시작됨: {_currentSerialNumber}";
+                        StatusLabel.ForeColor = Color.Green;
+                    }
+                    else
+                    {
+                        TestSessionButton.Text = "테스트 세션";
+                        TestSessionButton.BackColor = Color.LightGreen;
+                        StatusLabel.Text = "세션 시작 실패";
+                        StatusLabel.ForeColor = Color.Red;
+                    }
+                });
+            });
         }
     }
 

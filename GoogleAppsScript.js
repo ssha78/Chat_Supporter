@@ -51,6 +51,12 @@ function doPost(e) {
         return updateSession(data);
       case 'updateSessionStatus':
         return updateSessionStatus(data);
+      case 'assignStaffToSession':
+        return assignStaffToSession(data);
+      case 'releaseStaffFromSession':
+        return releaseStaffFromSession(data);
+      case 'checkSessionAssignment':
+        return checkSessionAssignment(data);
       default:
         return createResponse(false, `Unknown action: ${action}`);
     }
@@ -1562,3 +1568,243 @@ function LM100_demo() {
   Logger.log(LM100_composeSupportMessage('상태등이 보라/초록 입니다'));
 }
 /* ======================= END LM‑100 additions ======================= */
+
+/* ======================= SESSION ASSIGNMENT FUNCTIONS ======================= */
+
+/**
+ * LockService를 이용한 동시성 안전한 세션 할당
+ */
+function assignStaffToSession(data) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    // 5초 대기 후 락 획득 실패시 오류 반환
+    if (!lock.tryLock(5000)) {
+      return createResponse(false, '서버가 바쁩니다. 잠시 후 다시 시도해주세요.');
+    }
+
+    const { sessionId, staffId, staffName } = data;
+
+    if (!sessionId || !staffId) {
+      return createResponse(false, '세션 ID와 직원 ID가 필요합니다.');
+    }
+
+    console.log(`세션 할당 시도: ${sessionId} -> ${staffId}`);
+
+    // 1. ChatSessions 시트에서 현재 할당 상태 확인
+    const sessionsSheet = getSheet(CHAT_SHEET_ID, SHEETS.CHAT_SESSIONS);
+
+    if (sessionsSheet.getLastRow() <= 1) {
+      return createResponse(false, '세션을 찾을 수 없습니다.');
+    }
+
+    const sessionData = sessionsSheet.getDataRange().getValues();
+    const headers = sessionData[0];
+    const sessionIdIndex = headers.indexOf('Id');
+    const assignedStaffIndex = headers.indexOf('AssignedStaff');
+    const statusIndex = headers.indexOf('Status');
+    const assignedAtIndex = headers.indexOf('AssignedAt');
+
+    if (sessionIdIndex === -1 || assignedStaffIndex === -1 || statusIndex === -1) {
+      return createResponse(false, '세션 시트 구조 오류: 필수 컬럼이 없습니다.');
+    }
+
+    // 2. 세션 찾기 및 할당 상태 확인
+    let sessionRowIndex = -1;
+    let currentAssignedStaff = '';
+    let currentStatus = '';
+
+    for (let i = 1; i < sessionData.length; i++) {
+      if (sessionData[i][sessionIdIndex] === sessionId) {
+        sessionRowIndex = i;
+        currentAssignedStaff = sessionData[i][assignedStaffIndex] || '';
+        currentStatus = sessionData[i][statusIndex] || '';
+        break;
+      }
+    }
+
+    if (sessionRowIndex === -1) {
+      return createResponse(false, '세션을 찾을 수 없습니다.');
+    }
+
+    // 3. 이미 할당된 경우 확인
+    if (currentAssignedStaff && currentAssignedStaff.trim() !== '') {
+      if (currentAssignedStaff === staffId) {
+        return createResponse(true, '이미 본인에게 할당된 세션입니다.', {
+          sessionId: sessionId,
+          assignedStaff: currentAssignedStaff,
+          status: currentStatus,
+          alreadyAssigned: true
+        });
+      } else {
+        return createResponse(false, `이미 다른 직원(${currentAssignedStaff})이 상담 중입니다.`, {
+          sessionId: sessionId,
+          assignedStaff: currentAssignedStaff,
+          status: currentStatus,
+          conflictStaff: currentAssignedStaff
+        });
+      }
+    }
+
+    // 4. 할당 가능한 상태 확인 (Online 또는 Waiting 상태만 할당 가능)
+    if (currentStatus !== 'Online' && currentStatus !== 'Waiting') {
+      return createResponse(false, `할당 불가능한 세션 상태입니다: ${currentStatus}`);
+    }
+
+    // 5. 세션 할당 실행
+    const now = new Date().toISOString();
+    const actualRowIndex = sessionRowIndex + 1; // 시트에서는 1-based index
+
+    // 원자적 업데이트
+    sessionsSheet.getRange(actualRowIndex, assignedStaffIndex + 1).setValue(staffId);
+    sessionsSheet.getRange(actualRowIndex, statusIndex + 1).setValue('Active');
+
+    // AssignedAt 컬럼이 있는 경우 업데이트
+    if (assignedAtIndex !== -1) {
+      sessionsSheet.getRange(actualRowIndex, assignedAtIndex + 1).setValue(now);
+    }
+
+    console.log(`세션 할당 완료: ${sessionId} -> ${staffId} (${staffName || 'Unknown'})`);
+
+    return createResponse(true, '세션이 성공적으로 할당되었습니다.', {
+      sessionId: sessionId,
+      assignedStaff: staffId,
+      staffName: staffName || staffId,
+      status: 'Active',
+      assignedAt: now,
+      previousStatus: currentStatus
+    });
+
+  } catch (error) {
+    console.error('세션 할당 오류:', error);
+    return createResponse(false, `세션 할당 실패: ${error.message}`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 세션에서 직원 할당 해제
+ */
+function releaseStaffFromSession(data) {
+  const lock = LockService.getScriptLock();
+
+  try {
+    if (!lock.tryLock(5000)) {
+      return createResponse(false, '서버가 바쁩니다. 잠시 후 다시 시도해주세요.');
+    }
+
+    const { sessionId, staffId, reason } = data;
+
+    if (!sessionId || !staffId) {
+      return createResponse(false, '세션 ID와 직원 ID가 필요합니다.');
+    }
+
+    console.log(`세션 할당 해제 시도: ${sessionId} from ${staffId}, 사유: ${reason || 'N/A'}`);
+
+    const sessionsSheet = getSheet(CHAT_SHEET_ID, SHEETS.CHAT_SESSIONS);
+
+    if (sessionsSheet.getLastRow() <= 1) {
+      return createResponse(false, '세션을 찾을 수 없습니다.');
+    }
+
+    const sessionData = sessionsSheet.getDataRange().getValues();
+    const headers = sessionData[0];
+    const sessionIdIndex = headers.indexOf('Id');
+    const assignedStaffIndex = headers.indexOf('AssignedStaff');
+    const statusIndex = headers.indexOf('Status');
+
+    // 세션 찾기
+    let sessionRowIndex = -1;
+    let currentAssignedStaff = '';
+
+    for (let i = 1; i < sessionData.length; i++) {
+      if (sessionData[i][sessionIdIndex] === sessionId) {
+        sessionRowIndex = i;
+        currentAssignedStaff = sessionData[i][assignedStaffIndex] || '';
+        break;
+      }
+    }
+
+    if (sessionRowIndex === -1) {
+      return createResponse(false, '세션을 찾을 수 없습니다.');
+    }
+
+    // 권한 확인
+    if (currentAssignedStaff !== staffId) {
+      return createResponse(false, '본인에게 할당된 세션만 해제할 수 있습니다.');
+    }
+
+    // 할당 해제
+    const actualRowIndex = sessionRowIndex + 1;
+    sessionsSheet.getRange(actualRowIndex, assignedStaffIndex + 1).setValue('');
+    sessionsSheet.getRange(actualRowIndex, statusIndex + 1).setValue('Online');
+
+    console.log(`세션 할당 해제 완료: ${sessionId} from ${staffId}`);
+
+    return createResponse(true, '세션 할당이 해제되었습니다.', {
+      sessionId: sessionId,
+      releasedFrom: staffId,
+      newStatus: 'Online',
+      reason: reason || ''
+    });
+
+  } catch (error) {
+    console.error('세션 할당 해제 오류:', error);
+    return createResponse(false, `세션 할당 해제 실패: ${error.message}`);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 세션 할당 상태 확인 (락 없이 읽기 전용)
+ */
+function checkSessionAssignment(data) {
+  try {
+    const { sessionId } = data;
+
+    if (!sessionId) {
+      return createResponse(false, '세션 ID가 필요합니다.');
+    }
+
+    const sessionsSheet = getSheet(CHAT_SHEET_ID, SHEETS.CHAT_SESSIONS);
+
+    if (sessionsSheet.getLastRow() <= 1) {
+      return createResponse(false, '세션을 찾을 수 없습니다.');
+    }
+
+    const sessionData = sessionsSheet.getDataRange().getValues();
+    const headers = sessionData[0];
+    const sessionIdIndex = headers.indexOf('Id');
+    const assignedStaffIndex = headers.indexOf('AssignedStaff');
+    const statusIndex = headers.indexOf('Status');
+    const assignedAtIndex = headers.indexOf('AssignedAt');
+
+    // 세션 찾기
+    for (let i = 1; i < sessionData.length; i++) {
+      if (sessionData[i][sessionIdIndex] === sessionId) {
+        const assignedStaff = sessionData[i][assignedStaffIndex] || '';
+        const status = sessionData[i][statusIndex] || '';
+        const assignedAt = sessionData[i][assignedAtIndex] || '';
+
+        return createResponse(true, '세션 상태 조회 성공', {
+          sessionId: sessionId,
+          assignedStaff: assignedStaff,
+          status: status,
+          assignedAt: assignedAt,
+          isAssigned: assignedStaff.trim() !== '',
+          canAssign: assignedStaff.trim() === '' && (status === 'Online' || status === 'Waiting')
+        });
+      }
+    }
+
+    return createResponse(false, '세션을 찾을 수 없습니다.');
+
+  } catch (error) {
+    console.error('세션 상태 확인 오류:', error);
+    return createResponse(false, `세션 상태 확인 실패: ${error.message}`);
+  }
+}
+
+/* ======================= END SESSION ASSIGNMENT ======================= */
