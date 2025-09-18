@@ -79,9 +79,13 @@ pids
 *.seed
 *.pid.lock
 
-# Config files (comment out if you want to include them)
-# appsettings.Development.json
-# appsettings.Production.json
+# Config files with sensitive information
+appsettings.json
+appsettings.Development.json
+appsettings.Production.json
+
+# Google Apps Script files with personal URLs
+GoogleAppsScript.js
 
 # IDE files
 .claude/
